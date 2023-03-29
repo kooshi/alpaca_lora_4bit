@@ -25,6 +25,7 @@ assert peft.tuners.lora.is_gptq_available()
 
 import torch
 import transformers
+from datasets import load_dataset
 from autograd_4bit import load_llama_model_4bit_low_ram
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, PeftModel
 
@@ -32,7 +33,62 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, PeftMode
 from arg_parser import get_config
 import train_data
 
+
 ft_config = get_config()
+
+
+
+
+##################
+def generate_prompt(data_point):
+    # sorry about the formatting disaster gotta move fast
+    return f"""
+{data_point["func_documentation_string"]}
+{data_point["whole_func_string"]}"""
+
+def tokenize(prompt, add_eos_token=True):
+    # there's probably a way to do this with the tokenizer settings
+    # but again, gotta move fast
+    result = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=ft_config.cutoff_len,
+        padding=False,
+        return_tensors=None,
+    )
+    if (
+        result["input_ids"][-1] != tokenizer.eos_token_id
+        and len(result["input_ids"]) < ft_config.cutoff_len
+        and add_eos_token
+    ):
+        result["input_ids"].append(tokenizer.eos_token_id)
+        result["attention_mask"].append(1)
+
+    result["labels"] = result["input_ids"].copy()
+
+    return result
+
+def generate_and_tokenize_prompt(data_point):
+    full_prompt = generate_prompt(data_point)
+    tokenized_full_prompt = tokenize(full_prompt)
+    #if not train_on_inputs:
+    if True:
+        user_prompt = generate_prompt({**data_point, "whole_func_string": ""})
+        tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+        user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+        tokenized_full_prompt["labels"] = [
+            -100
+        ] * user_prompt_len + tokenized_full_prompt["labels"][
+            user_prompt_len:
+        ]  # could be sped up, probably
+    return tokenized_full_prompt
+
+def generate_and_tokenize_prompt_batch(examples):
+    return [generate_and_tokenize_prompt(e) for e in examples]
+
+
+###################
 
 # * Show loaded parameters
 if ft_config.local_rank == 0:
@@ -57,7 +113,7 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
 )
 if ft_config.lora_apply_dir is None:
-    model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, lora_config)#.to(torch.bfloat16)
 else:
     model = PeftModel.from_pretrained(model, ft_config.lora_apply_dir, device_map={'': 0}, torch_dtype=torch.float32)  # ! Direct copy from inference.py
     print(ft_config.lora_apply_dir, 'loaded')
@@ -76,17 +132,8 @@ tokenizer.pad_token_id = 0
 
 if not ft_config.skip:
     # Load Data
-    data = None
-    if ft_config.ds_type == "txt" and not ft_config.skip:
-        #### LLaMa
-        data = train_data.TrainTxt(ft_config.dataset, ft_config.val_set_size, tokenizer, ft_config.cutoff_len)
-    elif ft_config.ds_type == "alpaca" and not ft_config.skip:
-        #### Stanford Alpaca-like Data
-        data = train_data.TrainSAD(ft_config.dataset, ft_config.val_set_size, tokenizer, ft_config.cutoff_len)
-    else:
-        raise NotImplementedError("ERROR: Unknown dataset format")
-    data.prepare_data(thd=ft_config.txt_row_thd)
-    ####
+    train_data = load_dataset("code_search_net", "go", split="train").shuffle().map(generate_and_tokenize_prompt, num_proc=30)
+    #val_data = load_dataset("code_search_net", "go", split="validation").shuffle().map(generate_and_tokenize_prompt, num_proc=30)
 
     # Use gradient checkpointing
     if ft_config.gradient_checkpointing:
@@ -101,14 +148,15 @@ if not ft_config.skip:
 
     trainer = transformers.Trainer(
         model=model,
-        train_dataset=data.train_data,
-        eval_dataset=data.val_data,
+        train_dataset=train_data,
+        eval_dataset=None,
         args=transformers.TrainingArguments(
             per_device_train_batch_size=ft_config.mbatch_size,
             gradient_accumulation_steps=ft_config.gradient_accumulation_steps,
             warmup_steps=ft_config.warmup_steps,
             num_train_epochs=ft_config.epochs,
             learning_rate=ft_config.lr,
+            #bf16=True,
             fp16=True,
             logging_steps=ft_config.logging_steps,
             evaluation_strategy="no",
@@ -120,7 +168,9 @@ if not ft_config.skip:
             load_best_model_at_end=False,
             ddp_find_unused_parameters=False if ft_config.ddp else None,
         ),
-        data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        data_collator=transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
     )
     model.config.use_cache = False
 

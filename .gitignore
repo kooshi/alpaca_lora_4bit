@@ -1,4 +1,6 @@
 alpaca_lora/
+lora*/
+text-generation-webui/
 repository/
 __pycache__/
 llama-13b-4bit
